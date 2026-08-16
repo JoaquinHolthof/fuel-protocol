@@ -1,8 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import {
   Plus, Egg, Wheat, Activity, Pizza, Flame,
-  LayoutDashboard, Clock, X, Minus,
+  LayoutDashboard, Clock, X, Minus, Settings, Trophy, Lock, Check,
   Fish, UtensilsCrossed, Dumbbell, Sandwich, CookingPot,
   Apple, Banana, Leaf,
 } from "lucide-react";
@@ -19,7 +19,17 @@ type Counts   = Record<FoodKey, number>;
 type Macros   = { protein: number; carbs: number; fats: number; vitamins: number };
 type TimelineEntry = { time: string; label: string; items: string[] };
 type DayData  = { counts: Counts; macros: Macros; timeline: TimelineEntry[] };
-type TabId    = "log" | "dashboard" | "timing";
+type TabId    = "log" | "dashboard" | "timing" | "rewards";
+
+// Streak / gamification
+type StreakGoal = 30 | 50 | 100 | 200;
+type StreakState = {
+  goal: StreakGoal;
+  count: number;
+  lastLoggedDate: string | null; // yyyy-mm-dd, real calendar date
+  celebratedGoals: StreakGoal[]; // goals for which the unlock celebration was shown
+  claimedGoals: StreakGoal[];    // goals for which the reward was actually claimed
+};
 
 // ─── Food item definition ─────────────────────────────────────────────────────
 
@@ -47,6 +57,77 @@ const DAYS = [
 const TARGETS: Partial<Record<FoodKey, number>> = { eggs: 4, rice: 2, shake: 1 };
 const VITAMIN_KEYS: FoodKey[] = ["apple", "banana", "broccoli"];
 const VITAMIN_THRESHOLD = 2;
+
+// ── Gamification constants ─────────────────────────────────────────────────
+
+const STREAK_COLOR = "#fbbf24"; // amber — distinct from neon cyan / vitamin green / cheat orange
+const STREAK_STORAGE_KEY = "fuel-streak-state-v1";
+const STREAK_GOAL_OPTIONS: StreakGoal[] = [30, 50, 100, 200];
+
+const STREAK_REWARDS: Record<StreakGoal, { title: string; description: string; code?: string }> = {
+  30: {
+    title: "Discipline Badge",
+    description: "30 dagen protocol volgehouden. Je discipline-badge is ontgrendeld.",
+  },
+  50: {
+    title: "15% Fuel Discount",
+    description: "50 dagen op rij. Gebruik deze code op je volgende fitnessvoeding-bestelling.",
+    code: "STREAK50",
+  },
+  100: {
+    title: "Protocol Handbook",
+    description: "100 dagen streak. Exclusief e-book: Advanced Circadian Fueling is ontgrendeld.",
+  },
+  200: {
+    title: "Elite Operator Trophy",
+    description: "200 dagen. Gereserveerd voor de top van protocol-discipline.",
+  },
+};
+
+const DEFAULT_STREAK_STATE: StreakState = {
+  goal: 50,
+  count: 14, // startwaarde, komt overeen met de eerder statische headerwaarde
+  lastLoggedDate: null,
+  celebratedGoals: [],
+  claimedGoals: [],
+};
+
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function isYesterday(dateStr: string): boolean {
+  const d = new Date(dateStr);
+  const y = new Date();
+  y.setDate(y.getDate() - 1);
+  return d.toDateString() === y.toDateString();
+}
+
+function loadStreakState(): StreakState {
+  if (typeof window === "undefined") return DEFAULT_STREAK_STATE;
+  try {
+    const raw = window.localStorage.getItem(STREAK_STORAGE_KEY);
+    if (!raw) return DEFAULT_STREAK_STATE;
+    return { ...DEFAULT_STREAK_STATE, ...JSON.parse(raw) };
+  } catch {
+    return DEFAULT_STREAK_STATE;
+  }
+}
+
+function saveStreakState(state: StreakState) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(STREAK_STORAGE_KEY, JSON.stringify(state));
+}
+
+// Called on every log action. Only the FIRST log of a real calendar day
+// extends the streak; a missed day resets it to 1.
+function registerStreakLog(state: StreakState): StreakState {
+  const today = todayISO();
+  if (state.lastLoggedDate === today) return state;
+  const continuing = state.lastLoggedDate ? isYesterday(state.lastLoggedDate) : false;
+  const nextCount = continuing ? state.count + 1 : 1;
+  return { ...state, count: nextCount, lastLoggedDate: today };
+}
 
 // Modal categories — order determines display order
 const MODAL_CATEGORIES: Array<{
@@ -193,13 +274,13 @@ function NumberDisplay({ value, target }: { value: number; target: number }) {
   );
 }
 
-function ProgressBar({ value, target }: { value: number; target: number }) {
+function ProgressBar({ value, target, color = "#00f2ff" }: { value: number; target: number; color?: string }) {
   const pct = Math.min(100, (value / target) * 100);
   return (
     <div className="h-1.5 w-full rounded-full bg-white/5 overflow-hidden">
       <div
-        className="h-full rounded-full bg-neon transition-all duration-500"
-        style={{ width: `${pct}%`, boxShadow: "0 0 12px rgba(0,242,255,0.6)" }}
+        className="h-full rounded-full transition-all duration-500"
+        style={{ width: `${pct}%`, backgroundColor: color, boxShadow: `0 0 12px ${color}99` }}
       />
     </div>
   );
@@ -222,7 +303,6 @@ function MacroDonut({ macros }: { macros: Macros }) {
   const hasData = total > 0;
   const denom = total || 1;
 
-  // strokeDashoffset = C − cumStart positions each segment correctly.
   let cumStart = 0;
   const segments = MACRO_SEGMENTS.map((seg) => {
     const pts = macros[seg.key];
@@ -316,6 +396,341 @@ function Metric({ label, value, sub, highlight }: { label: string; value: number
   );
 }
 
+// ─── Streak / Gamification UI ─────────────────────────────────────────────────
+
+function StreakWidgetCard({
+  streak,
+  onOpenSettings,
+}: {
+  streak: StreakState;
+  onOpenSettings: () => void;
+}) {
+  const pct = Math.min(100, Math.round((streak.count / streak.goal) * 100));
+  return (
+    <div className="rounded-3xl bg-panel border border-hairline p-6">
+      <div className="flex items-center justify-between mb-5">
+        <div className="text-[10px] tracking-[0.3em] text-white/40">STREAK PROTOCOL</div>
+        <button
+          onClick={onOpenSettings}
+          className="text-[10px] tracking-[0.25em] text-white/40 hover:text-white/70 transition-colors flex items-center gap-1"
+        >
+          <Settings className="w-3 h-3" />
+          GOAL
+        </button>
+      </div>
+
+      <div className="flex items-center gap-4 mb-5">
+        <div
+          className="w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0"
+          style={{ backgroundColor: `${STREAK_COLOR}18`, border: `1px solid ${STREAK_COLOR}40` }}
+        >
+          <Flame className="w-6 h-6" style={{ color: STREAK_COLOR }} />
+        </div>
+        <div>
+          <div className="font-mono-tab">
+            <span className="font-display text-3xl" style={{ color: STREAK_COLOR }}>{streak.count}</span>
+            <span className="text-white/30 text-lg ml-1">/ {streak.goal}</span>
+          </div>
+          <div className="text-[10px] tracking-[0.25em] text-white/40 mt-1 uppercase">Dagen Streak</div>
+        </div>
+      </div>
+
+      <ProgressBar value={streak.count} target={streak.goal} color={STREAK_COLOR} />
+      <div className="flex justify-between text-[9px] tracking-[0.2em] text-white/30 mt-2 font-mono-tab">
+        <span>0</span>
+        <span style={{ color: STREAK_COLOR }}>{pct}%</span>
+        <span>{streak.goal}</span>
+      </div>
+    </div>
+  );
+}
+
+function StreakGoalPopover({
+  visible,
+  currentGoal,
+  onSelect,
+  onClose,
+}: {
+  visible: boolean;
+  currentGoal: StreakGoal;
+  onSelect: (goal: StreakGoal) => void;
+  onClose: () => void;
+}) {
+  if (!visible) return null;
+  return (
+    <>
+      <div className="absolute inset-0 z-40" onClick={onClose} />
+      <div className="absolute right-6 top-16 z-50 w-56 rounded-2xl bg-panel-elevated border border-hairline p-4">
+        <div className="text-[9px] tracking-[0.3em] text-white/40 mb-3">STREAK DOEL</div>
+        <div className="grid grid-cols-2 gap-2">
+          {STREAK_GOAL_OPTIONS.map((opt) => {
+            const active = opt === currentGoal;
+            return (
+              <button
+                key={opt}
+                onClick={() => { onSelect(opt); onClose(); }}
+                className="py-2.5 rounded-xl border font-mono-tab text-sm transition-colors bg-app hover:border-white/20"
+                style={
+                  active
+                    ? { color: STREAK_COLOR, backgroundColor: `${STREAK_COLOR}14`, borderColor: `${STREAK_COLOR}80` }
+                    : { color: "white", borderColor: "rgba(255,255,255,0.06)" }
+                }
+              >
+                {opt}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function StreakRewardModal({
+  goal,
+  visible,
+  onViewReward,
+}: {
+  goal: StreakGoal | null;
+  visible: boolean;
+  onViewReward: () => void;
+}) {
+  const reward = goal ? STREAK_REWARDS[goal] : null;
+  return (
+    <div
+      className="absolute inset-0 z-50 flex items-center justify-center p-6"
+      style={{
+        background: "rgba(0,0,0,0.88)",
+        backdropFilter: "blur(16px)",
+        opacity: visible ? 1 : 0,
+        pointerEvents: visible ? "auto" : "none",
+        transition: "opacity 300ms ease",
+      }}
+    >
+      <div
+        className="w-full max-w-xs bg-panel border rounded-3xl p-8 text-center"
+        style={{
+          borderColor: `${STREAK_COLOR}4d`,
+          boxShadow: `0 0 80px ${STREAK_COLOR}1f, 0 0 160px ${STREAK_COLOR}0f`,
+          transform: visible ? "scale(1)" : "scale(0.88)",
+          transition: "transform 350ms cubic-bezier(0.34, 1.56, 0.64, 1)",
+        }}
+      >
+        <div
+          className="w-14 h-14 rounded-2xl mx-auto flex items-center justify-center mb-5"
+          style={{ backgroundColor: `${STREAK_COLOR}18`, border: `1px solid ${STREAK_COLOR}40` }}
+        >
+          <Trophy className="w-6 h-6" style={{ color: STREAK_COLOR }} />
+        </div>
+        <div className="text-[9px] tracking-[0.45em] mb-3" style={{ color: STREAK_COLOR }}>
+          STREAK DOEL BEHAALD
+        </div>
+        <div className="font-display text-2xl text-white mb-2 leading-tight">
+          {goal} DAGEN<br />VOLGEHOUDEN
+        </div>
+        <div className="text-xs text-white/40 leading-relaxed mb-6">
+          {reward?.title} is ontgrendeld. Ga naar Beloningen om hem te claimen.
+        </div>
+        <div
+          className="w-12 h-px mx-auto mb-7"
+          style={{ background: `linear-gradient(90deg, transparent, ${STREAK_COLOR}, transparent)` }}
+        />
+        <button
+          onClick={onViewReward}
+          className="w-full py-3.5 rounded-xl font-display text-sm tracking-[0.2em] hover:opacity-90 active:scale-95 transition-all"
+          style={{ backgroundColor: STREAK_COLOR, color: "#1a1200" }}
+        >
+          BEKIJK BELONING
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Rewards page: locked / unlocked / claimed states ──────────────────────────
+
+const CLAIM_COLOR = "#10b981"; // reuse the app's existing "success" green
+
+function RewardCard({
+  goal,
+  streak,
+  onClaim,
+}: {
+  goal: StreakGoal;
+  streak: StreakState;
+  onClaim: (goal: StreakGoal) => void;
+}) {
+  const reward = STREAK_REWARDS[goal];
+  const claimed = streak.claimedGoals.includes(goal);
+  const unlocked = streak.count >= goal;
+  const locked = !unlocked;
+
+  return (
+    <div
+      className={`rounded-3xl border p-5 transition-all duration-300 ${
+        locked ? "border-hairline bg-panel opacity-50 grayscale pointer-events-none" : "bg-panel"
+      }`}
+      style={
+        !locked && !claimed
+          ? { borderColor: `${STREAK_COLOR}66`, boxShadow: `0 0 32px ${STREAK_COLOR}1a` }
+          : !locked && claimed
+          ? { borderColor: "rgba(255,255,255,0.08)" }
+          : undefined
+      }
+    >
+      <div className="flex items-start gap-4">
+        <div
+          className="relative w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0"
+          style={{
+            backgroundColor: claimed ? `${CLAIM_COLOR}18` : locked ? "rgba(255,255,255,0.05)" : `${STREAK_COLOR}18`,
+            border: `1px solid ${claimed ? `${CLAIM_COLOR}40` : locked ? "rgba(255,255,255,0.1)" : `${STREAK_COLOR}40`}`,
+          }}
+        >
+          {!locked && !claimed && (
+            <div className="absolute inset-0 rounded-2xl animate-pulse" style={{ boxShadow: `0 0 0 3px ${STREAK_COLOR}30` }} />
+          )}
+          {locked ? (
+            <Lock className="w-5 h-5 text-white/30" />
+          ) : claimed ? (
+            <Check className="w-5 h-5" style={{ color: CLAIM_COLOR }} />
+          ) : (
+            <Trophy className="w-5 h-5" style={{ color: STREAK_COLOR }} />
+          )}
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <div className="font-display text-sm text-white">{reward.title}</div>
+            <div className="text-[9px] tracking-[0.2em] text-white/30 font-mono-tab flex-shrink-0">{goal}D</div>
+          </div>
+          <div className="text-xs text-white/40 mt-1 leading-relaxed">{reward.description}</div>
+
+          {locked && (
+            <div className="text-[10px] text-white/30 mt-3">
+              Behaal je {goal}-dagen streak om te ontgrendelen (huidige voortgang: {Math.min(streak.count, goal)}/{goal})
+            </div>
+          )}
+        </div>
+      </div>
+
+      <button
+        onClick={() => onClaim(goal)}
+        disabled={locked || claimed}
+        className="w-full mt-4 py-3 rounded-xl font-display text-xs tracking-[0.2em] transition-all disabled:cursor-not-allowed"
+        style={
+          claimed
+            ? { backgroundColor: `${CLAIM_COLOR}1f`, color: CLAIM_COLOR, border: `1px solid ${CLAIM_COLOR}4d` }
+            : locked
+            ? { backgroundColor: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.3)", border: "1px solid rgba(255,255,255,0.08)" }
+            : { backgroundColor: STREAK_COLOR, color: "#1a1200" }
+        }
+      >
+        {claimed ? (
+          <span className="flex items-center justify-center gap-1.5">
+            <Check className="w-3.5 h-3.5" /> GECLAIMD
+          </span>
+        ) : locked ? (
+          <span className="flex items-center justify-center gap-1.5">
+            <Lock className="w-3.5 h-3.5" /> VERGRENDELD
+          </span>
+        ) : (
+          "CLAIM BELONING"
+        )}
+      </button>
+    </div>
+  );
+}
+
+function RewardsTab({
+  streak,
+  onClaim,
+}: {
+  streak: StreakState;
+  onClaim: (goal: StreakGoal) => void;
+}) {
+  const unlockedCount = STREAK_GOAL_OPTIONS.filter((g) => streak.count >= g).length;
+  return (
+    <div className="px-6 space-y-6 animate-in fade-in duration-300">
+      <div>
+        <div className="text-[10px] tracking-[0.3em] text-white/40">GAMIFICATION</div>
+        <div className="font-display text-2xl mt-1">Beloningen</div>
+        <div className="text-xs text-white/40 mt-1">
+          {unlockedCount} / {STREAK_GOAL_OPTIONS.length} ontgrendeld op basis van je streak.
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {STREAK_GOAL_OPTIONS.map((goal) => (
+          <RewardCard key={goal} goal={goal} streak={streak} onClaim={onClaim} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ClaimConfirmationModal({
+  goal,
+  visible,
+  onClose,
+}: {
+  goal: StreakGoal | null;
+  visible: boolean;
+  onClose: () => void;
+}) {
+  const reward = goal ? STREAK_REWARDS[goal] : null;
+  return (
+    <div
+      className="absolute inset-0 z-50 flex items-center justify-center p-6"
+      style={{
+        background: "rgba(0,0,0,0.88)",
+        backdropFilter: "blur(16px)",
+        opacity: visible ? 1 : 0,
+        pointerEvents: visible ? "auto" : "none",
+        transition: "opacity 300ms ease",
+      }}
+    >
+      <div
+        className="w-full max-w-xs bg-panel border rounded-3xl p-8 text-center"
+        style={{
+          borderColor: `${CLAIM_COLOR}4d`,
+          boxShadow: `0 0 80px ${CLAIM_COLOR}1f, 0 0 160px ${CLAIM_COLOR}0f`,
+          transform: visible ? "scale(1)" : "scale(0.88)",
+          transition: "transform 350ms cubic-bezier(0.34, 1.56, 0.64, 1)",
+        }}
+      >
+        <div
+          className="w-14 h-14 rounded-2xl mx-auto flex items-center justify-center mb-5"
+          style={{ backgroundColor: `${CLAIM_COLOR}18`, border: `1px solid ${CLAIM_COLOR}40` }}
+        >
+          <Check className="w-6 h-6" style={{ color: CLAIM_COLOR }} />
+        </div>
+        <div className="text-[9px] tracking-[0.45em] mb-3" style={{ color: CLAIM_COLOR }}>
+          BELONING GECLAIMD
+        </div>
+        <div className="font-display text-2xl text-white mb-2 leading-tight">
+          {reward?.title}
+        </div>
+        <div className="text-xs text-white/40 leading-relaxed mb-6">
+          {reward?.description}
+        </div>
+        {reward?.code && (
+          <div className="rounded-xl bg-app border border-hairline p-3 mb-6">
+            <div className="text-[9px] tracking-[0.25em] text-white/40 mb-1">JOUW CODE</div>
+            <div className="font-mono-tab text-sm" style={{ color: CLAIM_COLOR }}>{reward.code}</div>
+          </div>
+        )}
+        <button
+          onClick={onClose}
+          className="w-full py-3.5 rounded-xl font-display text-sm tracking-[0.2em] hover:opacity-90 active:scale-95 transition-all"
+          style={{ backgroundColor: CLAIM_COLOR, color: "#04241a" }}
+        >
+          SLUITEN
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Tab Button ───────────────────────────────────────────────────────────────
 
 function TabButton({ id, label, active, onClick, Icon }: {
@@ -344,7 +759,6 @@ function LogModal({ visible, onClose, onLog, dayData }: {
 }) {
   return (
     <>
-      {/* Backdrop */}
       <div
         onClick={onClose}
         className="absolute inset-0 z-40"
@@ -357,7 +771,6 @@ function LogModal({ visible, onClose, onLog, dayData }: {
         }}
       />
 
-      {/* Sheet */}
       <div
         className="absolute bottom-0 left-0 right-0 z-50 rounded-t-3xl bg-panel-elevated border-t border-x border-hairline"
         style={{
@@ -371,12 +784,10 @@ function LogModal({ visible, onClose, onLog, dayData }: {
           flexDirection: "column",
         }}
       >
-        {/* Drag handle */}
         <div className="flex justify-center pt-3 pb-1 flex-shrink-0">
           <div className="w-10 h-1 rounded-full bg-white/20" />
         </div>
 
-        {/* Header */}
         <div className="px-6 pt-3 pb-3 flex items-start justify-between flex-shrink-0">
           <div>
             <div className="text-[10px] tracking-[0.35em] text-neon">LOG FUEL SOURCE</div>
@@ -391,17 +802,14 @@ function LogModal({ visible, onClose, onLog, dayData }: {
           </button>
         </div>
 
-        {/* Scrollable categories */}
         <div className="overflow-y-auto px-6 pb-2 space-y-5">
           {MODAL_CATEGORIES.map((cat) => (
             <div key={cat.id}>
-              {/* Category header */}
               <div className="flex items-center gap-2 mb-2">
                 <div className="w-1.5 h-3.5 rounded-full" style={{ backgroundColor: cat.color }} />
                 <span className="text-[9px] tracking-[0.35em] text-white/40">{cat.label}</span>
               </div>
 
-              {/* Items grid */}
               <div className={`grid gap-2 ${cat.items.length === 1 ? "grid-cols-1" : cat.items.length === 3 ? "grid-cols-3" : "grid-cols-2"}`}>
                 {cat.items.map(({ key, label, sub, Icon }) => (
                   <button
@@ -444,7 +852,7 @@ function LogModal({ visible, onClose, onLog, dayData }: {
   );
 }
 
-// ─── Goal Achieved Overlay ────────────────────────────────────────────────────
+// ─── Goal Achieved Overlay (daily nutrition target — unrelated to streaks) ────
 
 function GoalOverlay({ item, onClose }: { item: string | null; onClose: () => void }) {
   const visible = item !== null;
@@ -550,7 +958,6 @@ function LogTab({ activeDay, setActiveDay, dayData, onOpenModal, onAdjust }: {
   const totalLogged = Object.values(dayData.counts).reduce((s, v) => s + v, 0);
   return (
     <div className="px-6 space-y-8 animate-in fade-in duration-300">
-      {/* Calendar slider */}
       <div>
         <div className="flex items-end justify-between mb-3">
           <div>
@@ -580,7 +987,6 @@ function LogTab({ activeDay, setActiveDay, dayData, onOpenModal, onAdjust }: {
         </div>
       </div>
 
-      {/* Primary CTA */}
       <button
         onClick={onOpenModal}
         className="w-full rounded-3xl bg-panel border border-hairline p-6 text-left group hover:border-neon/40 transition-all"
@@ -599,7 +1005,6 @@ function LogTab({ activeDay, setActiveDay, dayData, onOpenModal, onAdjust }: {
         </div>
       </button>
 
-      {/* Overview grid */}
       <OverviewGrid dayData={dayData} onAdjust={onAdjust} />
     </div>
   );
@@ -607,7 +1012,17 @@ function LogTab({ activeDay, setActiveDay, dayData, onOpenModal, onAdjust }: {
 
 // ─── Dashboard Tab ────────────────────────────────────────────────────────────
 
-function DashboardTab({ dayData, discipline }: { dayData: DayData; discipline: number }) {
+function DashboardTab({
+  dayData,
+  discipline,
+  streak,
+  onOpenStreakSettings,
+}: {
+  dayData: DayData;
+  discipline: number;
+  streak: StreakState;
+  onOpenStreakSettings: () => void;
+}) {
   const { counts, macros } = dayData;
   const totalItems = Object.values(counts).reduce((s, v) => s + v, 0);
 
@@ -618,13 +1033,14 @@ function DashboardTab({ dayData, discipline }: { dayData: DayData; discipline: n
         <div className="font-display text-2xl mt-1">Today's Protocol</div>
       </div>
 
+      <StreakWidgetCard streak={streak} onOpenSettings={onOpenStreakSettings} />
+
       <div className="grid grid-cols-3 gap-3">
         <Metric label="Logged" value={totalItems} sub="ITEMS" />
         <Metric label="Discipline" value={discipline} sub="%" highlight />
         <Metric label="Window" value={13} sub="HRS" />
       </div>
 
-      {/* Macro donut */}
       <div className="rounded-3xl bg-panel border border-hairline p-6">
         <div className="flex items-center justify-between mb-5">
           <div className="text-[10px] tracking-[0.3em] text-white/40">MACRO ANALYSIS</div>
@@ -633,7 +1049,6 @@ function DashboardTab({ dayData, discipline }: { dayData: DayData; discipline: n
         <MacroDonut macros={macros} />
       </div>
 
-      {/* Progress bars */}
       <div className="rounded-3xl bg-panel border border-hairline p-6 space-y-5">
         <div className="text-[10px] tracking-[0.3em] text-white/40">DAILY TARGETS</div>
         <div>
@@ -767,6 +1182,14 @@ export default function FuelApp() {
   const [showModal, setShowModal] = useState(false);
   const [goalItem, setGoalItem] = useState<string | null>(null);
 
+  // Streak / gamification state
+  const [streak, setStreak] = useState<StreakState>(DEFAULT_STREAK_STATE);
+  const [streakHydrated, setStreakHydrated] = useState(false);
+  const [showStreakSettings, setShowStreakSettings] = useState(false);
+  const [showStreakReward, setShowStreakReward] = useState(false);
+  const [rewardGoal, setRewardGoal] = useState<StreakGoal | null>(null);
+  const [claimedPopupGoal, setClaimedPopupGoal] = useState<StreakGoal | null>(null);
+
   const dayData = allDays[activeDay];
 
   const discipline = useMemo(() => {
@@ -776,6 +1199,49 @@ export default function FuelApp() {
     return Math.round((homeTotal / all) * 100);
   }, [dayData.counts]);
 
+  // Hydrate streak state from localStorage on mount (client-only)
+  useEffect(() => {
+    setStreak(loadStreakState());
+    setStreakHydrated(true);
+  }, []);
+
+  // Persist on every change, once hydrated
+  useEffect(() => {
+    if (!streakHydrated) return;
+    saveStreakState(streak);
+  }, [streak, streakHydrated]);
+
+  // Detect goal reached → show the unlock-celebration modal once per goal
+  useEffect(() => {
+    if (!streakHydrated) return;
+    if (streak.count >= streak.goal && !streak.celebratedGoals.includes(streak.goal)) {
+      setRewardGoal(streak.goal);
+      setShowStreakReward(true);
+    }
+  }, [streak, streakHydrated]);
+
+  // "Bekijk beloning" in the celebration modal → dismiss it and jump to the Rewards tab
+  const viewRewardFromCelebration = () => {
+    setShowStreakReward(false);
+    setStreak((prev) =>
+      prev.celebratedGoals.includes(prev.goal)
+        ? prev
+        : { ...prev, celebratedGoals: [...prev.celebratedGoals, prev.goal] }
+    );
+    setTab("rewards");
+  };
+
+  const changeStreakGoal = (goal: StreakGoal) => {
+    setStreak((prev) => ({ ...prev, goal }));
+  };
+
+  // Explicit claim from the Rewards page — only valid once unlocked
+  const claimReward = (goal: StreakGoal) => {
+    if (streak.count < goal || streak.claimedGoals.includes(goal)) return;
+    setStreak((prev) => ({ ...prev, claimedGoals: [...prev.claimedGoals, goal] }));
+    setClaimedPopupGoal(goal);
+  };
+
   const logItem = (key: FoodKey) => {
     const now = new Date();
     const timeStr = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
@@ -784,7 +1250,6 @@ export default function FuelApp() {
     const prevCount = dayData.counts[key];
     const target = TARGETS[key];
 
-    // Check vitamin threshold before state update
     const prevVitaminItems = VITAMIN_KEYS.reduce((s, k) => s + dayData.counts[k], 0);
     const willHitVitamin = VITAMIN_KEYS.includes(key) && prevVitaminItems + 1 === VITAMIN_THRESHOLD;
 
@@ -806,14 +1271,15 @@ export default function FuelApp() {
       return updated;
     });
 
+    // Any logged item extends today's streak (once per real calendar day)
+    setStreak((prev) => registerStreakLog(prev));
+
     setShowModal(false);
 
-    // Protocol goal toast
     if (target !== undefined && prevCount + 1 === target) {
       setTimeout(() => setGoalItem(food.label), 420);
     }
 
-    // Vitamin threshold toast (green)
     if (willHitVitamin) {
       setTimeout(() => {
         toast.success("Circadian micronutrient target reached! 🍏", {
@@ -849,10 +1315,8 @@ export default function FuelApp() {
 
   return (
     <div className="min-h-screen w-full bg-app flex justify-center">
-      {/* Phone frame: flex column, strictly bounded height, no overflow leak */}
       <div className="relative w-full max-w-md h-screen bg-app overflow-hidden flex flex-col">
 
-        {/* Header — fixed height, never scrolls */}
         <header className="flex-shrink-0 px-6 pt-10 pb-6 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-full border border-neon flex items-center justify-center shadow-neon">
@@ -863,13 +1327,23 @@ export default function FuelApp() {
               <div className="text-[9px] tracking-[0.3em] text-white/40 mt-1">PROTOCOL v1.0</div>
             </div>
           </div>
-          <div className="text-right">
-            <div className="text-[9px] tracking-[0.3em] text-white/40">STREAK</div>
-            <div className="font-display text-neon text-sm font-mono-tab">14 DAYS</div>
-          </div>
+          <button
+            onClick={() => setShowStreakSettings((v) => !v)}
+            className="text-right flex items-center gap-2 group"
+          >
+            <div>
+              <div className="text-[9px] tracking-[0.3em] text-white/40 flex items-center gap-1 justify-end">
+                STREAK
+                <Settings className="w-2.5 h-2.5 opacity-0 group-hover:opacity-60 transition-opacity" />
+              </div>
+              <div className="font-display text-sm font-mono-tab" style={{ color: STREAK_COLOR }}>
+                {streak.count} DAYS
+              </div>
+            </div>
+            <Flame className="w-4 h-4" style={{ color: STREAK_COLOR }} />
+          </button>
         </header>
 
-        {/* Scrollable content area — fills remaining space, stops before nav */}
         <div className="flex-1 overflow-y-auto pb-24 scrollbar-none">
           {tab === "log" && (
             <LogTab
@@ -880,20 +1354,27 @@ export default function FuelApp() {
               onAdjust={adjustItem}
             />
           )}
-          {tab === "dashboard" && <DashboardTab dayData={dayData} discipline={discipline} />}
+          {tab === "dashboard" && (
+            <DashboardTab
+              dayData={dayData}
+              discipline={discipline}
+              streak={streak}
+              onOpenStreakSettings={() => setShowStreakSettings(true)}
+            />
+          )}
           {tab === "timing" && <TimingTab key={activeDay} timeline={dayData.timeline} />}
+          {tab === "rewards" && <RewardsTab streak={streak} onClaim={claimReward} />}
         </div>
 
-        {/* Bottom nav — locked to frame bottom, never scrolls away */}
         <nav className="absolute bottom-0 left-0 right-0 z-50 bg-[#05070a]/90 backdrop-blur-md border-t border-[#1e293b] px-4 pb-5 pt-3">
           <div className="bg-panel-elevated/90 backdrop-blur border border-hairline rounded-2xl flex items-center justify-around p-2">
             <TabButton id="log" label="Log Fuel" active={tab === "log"} onClick={setTab} Icon={Plus} />
             <TabButton id="dashboard" label="Dashboard" active={tab === "dashboard"} onClick={setTab} Icon={LayoutDashboard} />
             <TabButton id="timing" label="Timeline" active={tab === "timing"} onClick={setTab} Icon={Clock} />
+            <TabButton id="rewards" label="Rewards" active={tab === "rewards"} onClick={setTab} Icon={Trophy} />
           </div>
         </nav>
 
-        {/* Overlays — absolute within the phone container */}
         <LogModal
           visible={showModal}
           onClose={() => setShowModal(false)}
@@ -901,6 +1382,23 @@ export default function FuelApp() {
           dayData={dayData}
         />
         <GoalOverlay item={goalItem} onClose={() => setGoalItem(null)} />
+
+        <StreakGoalPopover
+          visible={showStreakSettings}
+          currentGoal={streak.goal}
+          onSelect={changeStreakGoal}
+          onClose={() => setShowStreakSettings(false)}
+        />
+        <StreakRewardModal
+          goal={rewardGoal}
+          visible={showStreakReward}
+          onViewReward={viewRewardFromCelebration}
+        />
+        <ClaimConfirmationModal
+          goal={claimedPopupGoal}
+          visible={claimedPopupGoal !== null}
+          onClose={() => setClaimedPopupGoal(null)}
+        />
       </div>
     </div>
   );
